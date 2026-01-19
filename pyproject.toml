@@ -1,0 +1,10 @@
+[project]
+name = "wp5-seg"
+version = "0.1.0"
+description = "Monai Unet"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "monai>=1.5.1",
+    "nibabel>=5.3.3",
+]

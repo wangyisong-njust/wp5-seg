@@ -1,0 +1,14 @@
+python train.py \
+  --data_dir /mnt/sdb/Data/3DDL-WP5-Data/3ddl-dataset/data \
+  --output_dir runs/wp5_baseline \
+  --epochs 30 \
+  --batch_size 4 \
+  --num_workers 4 \
+  --lr 0.001 \
+  --subset_ratio 1.0 \
+  --seed 42 \
+  --roi_x 112 \
+  --roi_y 112 \
+  --roi_z 80 \
+  --log_to_file \
+  --log_file_name train.log

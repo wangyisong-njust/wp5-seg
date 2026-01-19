@@ -1,0 +1,3 @@
+[submodule "3ddl-dataset"]
+	path = 3ddl-dataset
+	url = git@github.com:gaieepo/3ddl-dataset.git
