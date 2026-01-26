@@ -496,6 +496,10 @@ def train(args):
         f"optimizer={opt_name}, base_lr={base_lr:.2e}, epochs={args.epochs}, milestones={milestones}"
     )
 
+    # Timing tracking
+    run_start_time = time.time()
+    epoch_train_times = []  # Training time per epoch (excluding eval)
+
     for epoch in range(1, args.epochs + 1):
         net.train()
         epoch_loss = 0.0
@@ -526,10 +530,14 @@ def train(args):
             epoch_loss += loss.item()
             n_batches += 1
 
-        dur = time.time() - t0
+        epoch_train_time = time.time() - t0
+        epoch_train_times.append(epoch_train_time)
+        accumulated_train_time = sum(epoch_train_times)
         avg_loss = epoch_loss / max(n_batches, 1)
         print(
-            f"Epoch {epoch}/{args.epochs} - loss {avg_loss:.4f} - {dur:.1f}s - lr {optimizer.param_groups[0]['lr']:.2e}"
+            f"Epoch {epoch}/{args.epochs} - loss {avg_loss:.4f} - "
+            f"train {epoch_train_time:.1f}s (total {accumulated_train_time:.1f}s) - "
+            f"lr {optimizer.param_groups[0]['lr']:.2e}"
         )
 
         # Evaluate on test set
@@ -567,7 +575,16 @@ def train(args):
         torch.save(net.state_dict(), out_dir / "last.ckpt")
         scheduler.step()
 
-    print(f"Training complete. Best avg Dice (0..4): {best_dice:.4f}")
+    # Timing summary
+    total_elapsed = time.time() - run_start_time
+    total_train_time = sum(epoch_train_times)
+    avg_epoch_train_time = total_train_time / len(epoch_train_times) if epoch_train_times else 0.0
+    print(f"\nTraining complete. Best avg Dice (0..4): {best_dice:.4f}")
+    print("=== Timing Summary ===")
+    print(f"Total elapsed time:      {total_elapsed:.1f}s ({total_elapsed / 60:.2f} min)")
+    print(f"Total training time:     {total_train_time:.1f}s ({total_train_time / 60:.2f} min)")
+    print(f"Per-epoch training avg:  {avg_epoch_train_time:.1f}s")
+    print(f"Per-epoch training times: {[round(t, 1) for t in epoch_train_times]}")
 
     # Final evaluation on training set using best checkpoint
     print("\nEvaluating best checkpoint on training set...")

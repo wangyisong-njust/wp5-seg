@@ -12,7 +12,7 @@ wheels/
 
 # WP5
 runs/
-compare/
+archive/
 *.bak
 *.bak.py
 *.swp
