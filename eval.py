@@ -142,11 +142,18 @@ def main():
     )
 
     # Model - BasicUNet matching train.py
-    net = BasicUNet(spatial_dims=3, in_channels=1, out_channels=5).to(device)
+    # Support both original (state_dict) and pruned (dict with 'features') checkpoints
+    raw_ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    if isinstance(raw_ckpt, dict) and "features" in raw_ckpt:
+        features = tuple(raw_ckpt["features"])
+        net = BasicUNet(spatial_dims=3, in_channels=1, out_channels=5, features=features).to(device)
+        sd = raw_ckpt["state_dict"]
+        print(f"Detected pruned model: features={features}")
+    else:
+        net = BasicUNet(spatial_dims=3, in_channels=1, out_channels=5).to(device)
+        sd = raw_ckpt.get("state_dict", raw_ckpt) if isinstance(raw_ckpt, dict) else raw_ckpt
 
     # Load checkpoint
-    sd = torch.load(args.ckpt, map_location=device)
-    sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
     net.load_state_dict(sd, strict=True)
     print(f"Loaded checkpoint: {args.ckpt}")
 
