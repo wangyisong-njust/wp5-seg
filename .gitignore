@@ -17,3 +17,4 @@ archive/
 *.bak.py
 *.swp
 .DS_Store
+pruning/output/
