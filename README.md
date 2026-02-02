@@ -1,1 +1,1 @@
-# WP5 Segmentation Baseline for 3DDL Project
+# WP5 Segmentation for 3DDL Project
