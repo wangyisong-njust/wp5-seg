@@ -1,0 +1,371 @@
+# WP5 3D语义分割 — 模型训练与压缩加速
+
+本项目是 [3D-IntelliScan](https://github.com/wangyisong-njust/intelliscan) 半导体检测流水线中 **3D语义分割模块** 的训练与优化工程。
+
+实现了完整的优化流程：**基线训练** → **结构化剪枝** → **微调恢复** → **TensorRT量化** → **性能基准测试**，最终在 **精度无损**（Dice 0.9080 vs 基线 0.9038）的前提下，实现 **单patch推理11.7倍加速**、**参数量减少75%**。
+
+---
+
+## 项目结构
+
+```
+wp5-seg/
+├── train.py                        # 基线模型训练
+├── eval.py                         # 模型评估（Dice/IoU/HD/ASD）
+├── run.sh                          # 训练启动脚本
+├── run_eval.sh                     # 评估启动脚本
+├── 3ddl-dataset/                   # 数据集加载子模块
+├── pruning/
+│   ├── prune_basicunet.py          # L2-norm结构化剪枝
+│   ├── finetune_pruned.py          # 剪枝后微调训练
+│   ├── export_onnx.py              # PyTorch → ONNX导出
+│   ├── build_trt_engine.py         # ONNX → TensorRT引擎构建
+│   ├── benchmark.py                # PyTorch FP32/AMP性能测试
+│   ├── benchmark_trt.py            # TensorRT vs PyTorch性能对比
+│   └── run_pruning_pipeline.sh     # 一键运行完整剪枝流程
+└── pyproject.toml                  # 依赖配置（Python 3.12+）
+```
+
+---
+
+## 模型架构
+
+| 项目 | 规格 |
+|------|------|
+| 模型 | MONAI BasicUNet (3D) |
+| 输入 | 单通道3D体积 `(1, 1, X, Y, Z)` |
+| 输出 | 5类语义分割 |
+| Features | `(32, 32, 64, 128, 256, 32)` |
+| 参数量 | 5.75M |
+| 归一化层 | InstanceNorm3d |
+| 跳跃连接 | 拼接（Concatenation） |
+
+**分割类别：**
+- Class 0：背景（Background）
+- Class 1：铜柱（Copper Pillar）
+- Class 2：焊料（Solder）
+- Class 3：空洞/缺陷（Void）
+- Class 4：铜垫（Copper Pad）
+
+---
+
+## 环境配置
+
+```bash
+# 基础依赖（Python 3.12+）
+pip install monai>=1.5.1 nibabel>=5.3.3 torch
+
+# 剪枝与TensorRT优化额外依赖
+pip install onnx tensorrt pycuda
+```
+
+### 数据格式
+
+```
+data/
+├── images/              # NIfTI .nii.gz 图像文件
+├── labels/              # NIfTI .nii.gz 标签文件
+├── metadata.jsonl       # 样本元数据
+└── dataset_config.json  # 训练/测试划分（test_serial_numbers）
+```
+
+---
+
+## 第一阶段：基线训练
+
+### 训练命令
+
+```bash
+python train.py \
+  --data_dir /path/to/data \
+  --output_dir runs/wp5_baseline \
+  --epochs 30 \
+  --batch_size 4 \
+  --lr 0.001 \
+  --seed 42
+```
+
+### 训练配置
+
+| 项目 | 配置 |
+|------|------|
+| 损失函数 | 0.5 x CrossEntropy + 0.5 x Dice（忽略class 6） |
+| 优化器 | Novograd（不可用时回退到Adam） |
+| 学习率调度 | MultiStepLR（在60%和85%处衰减） |
+| 数据增强 | ClipZScoreNormalize + 三轴随机翻转 + 随机裁剪 |
+| ROI尺寸 | 112 x 112 x 80 |
+| 推理方式 | 滑动窗口（overlap=0.5，高斯加权） |
+
+**数据预处理 — ClipZScoreNormalize：**
+
+针对半导体CT数据中常见的强度异常值问题，采用鲁棒的归一化策略：先将体素强度裁剪到 [第1百分位, 第99百分位] 范围内，再进行z-score标准化（减均值、除标准差）。这比直接min-max归一化更稳健，不会被极端异常值影响。
+
+### 评估命令
+
+```bash
+python eval.py \
+  --ckpt runs/wp5_baseline/best.ckpt \
+  --data_dir /path/to/data \
+  --output_dir runs/wp5_baseline/eval \
+  --save_preds --heavy --hd_percentile 95
+```
+
+支持的评估指标：Dice系数、IoU（Jaccard）、Hausdorff距离（HD95）、平均表面距离（ASD）。
+
+### 基线精度（174个测试样本）
+
+| 类别 | Dice | IoU |
+|------|------|-----|
+| Class 0（背景） | 0.9919 | — |
+| Class 1（铜柱） | 0.9409 | — |
+| Class 2（焊料） | 0.9056 | — |
+| Class 3（空洞） | 0.7995 | — |
+| Class 4（铜垫） | 0.8818 | — |
+| **平均** | **0.9038** | **0.8516** |
+
+---
+
+## 第二阶段：模型压缩
+
+### 总体流程
+
+```
+训练好的模型（5.75M参数，22MB）
+    ↓
+[1] 结构化剪枝（50%通道）  →  1.44M参数，5.6MB
+    ↓
+[2] 微调恢复（50 epochs）   →  Dice: 0.3341 → 0.9080
+    ↓
+[3] TensorRT量化（FP16）    →  4.5MB引擎，1.72ms延迟
+```
+
+---
+
+### 步骤1：结构化剪枝
+
+**方法：** 基于L2-norm的通道重要性评估，对BasicUNet进行对称编码器-解码器结构化剪枝。
+
+```bash
+python pruning/prune_basicunet.py \
+  --model_path runs/wp5_baseline/best.ckpt \
+  --pruning_ratio 0.5 \
+  --output_path output/pruned_model.ckpt
+```
+
+#### 技术细节
+
+**1）通道重要性计算**
+
+对于每个卷积层，输出通道 `i` 的重要性通过以下公式计算：
+
+```
+importance_i = ||W_i||_2 × |γ_i|
+```
+
+其中 `W_i` 是通道 `i` 对应的卷积核权重（展平后的L2范数），`γ_i` 是对应InstanceNorm3d层的仿射缩放参数。这个公式结合了滤波器本身的权重大小和归一化层学到的缩放因子，能更准确地衡量每个通道对输出的贡献。
+
+- 如果一个通道的卷积权重很小（L2范数低），说明该通道提取的特征幅度小
+- 如果归一化层的γ也很小，说明网络在训练过程中学会了抑制该通道
+- 两者相乘后排序，移除重要性最低的通道
+
+**2）对称剪枝约束**
+
+BasicUNet采用 **拼接（Concatenation）** 跳跃连接，解码器中每个UpCat块将编码器的skip特征与上采样的解码器特征拼接：`cat[skip(f_enc), upsample(f_dec)]`。这产生了硬约束：编码器和对应的解码器层必须保持相同的通道数，否则拼接维度不匹配。
+
+因此需要**对称剪枝**：
+
+| 对称对 | 编码器 | 解码器 |
+|--------|--------|--------|
+| f1层 | `down_1` | `upcat_2` |
+| f2层 | `down_2` | `upcat_3` |
+| f3层 | `down_3` | `upcat_4` |
+
+对于每个对称对，将编码器和解码器的通道重要性取平均，避免剪枝偏向某一侧。另有三个层独立剪枝：`conv_0`（输入层）、`down_4`（瓶颈层）、`upcat_1`（最终输出层）。
+
+> 注意：这与VNet的剪枝不同。VNet使用元素级加法（element-wise addition）跳跃连接，而BasicUNet使用拼接。拼接方式在剪枝时需要特殊处理拼接维度的索引映射。
+
+**3）架构感知的权重复制**
+
+我们没有采用mask-based稀疏剪枝（只是将权重置零，不减少实际计算量），而是利用MONAI BasicUNet的 `features` 参数直接构建一个物理上更小的新网络。将原模型中被选中保留的通道权重精确复制到新模型中。
+
+对于解码器的权重复制需要特别注意：拼接层的输入通道索引分为两部分——前半部分来自skip连接（编码器），后半部分来自上采样（解码器），需要分别映射正确的通道索引。
+
+**剪枝结果（50%剪枝率）：**
+
+| 项目 | 原始模型 | 剪枝后 | 压缩比 |
+|------|----------|--------|--------|
+| Features | (32, 32, 64, 128, 256, 32) | (16, 16, 32, 64, 128, 16) | — |
+| 参数量 | 5.75M | 1.44M | **减少75%** |
+| 模型大小 | 22MB | 5.6MB | **减少75%** |
+
+> 为什么50%通道剪枝能减少75%参数？因为卷积层参数量与通道数呈二次关系（每层参数 = C_out × C_in × k³），当输入和输出通道都减半时，参数量变为原来的1/4。
+
+---
+
+### 步骤2：微调恢复精度
+
+剪枝后模型精度从0.9038骤降至0.3341，需要通过微调（fine-tuning）恢复。为确保公平对比，微调使用与基线完全相同的训练配置。
+
+```bash
+python pruning/finetune_pruned.py \
+  --pruned_model_path output/pruned_model.ckpt \
+  --data_dir /path/to/data \
+  --output_dir runs/finetune_pruned \
+  --epochs 50 \
+  --lr 1e-4
+```
+
+| 项目 | 配置 |
+|------|------|
+| 损失函数 | 0.5 x CE + 0.5 x Dice（与基线完全一致） |
+| 优化器 | Adam，lr=1e-4（低于从头训练的学习率） |
+| 学习率调度 | ReduceLROnPlateau（patience=5, factor=0.5） |
+| 训练轮数 | 50 epochs |
+| 数据增强 | 与基线训练完全一致 |
+
+**微调结果：**
+
+| 阶段 | 平均Dice |
+|------|----------|
+| 剪枝后（未微调） | 0.3341 |
+| 微调后（50 epochs） | **0.9080** |
+| 原始基线 | 0.9038 |
+
+微调后的剪枝模型精度反而略高于原始基线（+0.0042 Dice），说明剪枝起到了**正则化**效果——去除冗余通道后，模型的泛化能力反而有所提升。
+
+---
+
+### 步骤3：TensorRT量化
+
+将剪枝后的PyTorch模型转换为TensorRT优化推理引擎，进一步压缩延迟。
+
+**转换流程：** `PyTorch (.ckpt) → ONNX (opset 18) → TensorRT Engine`
+
+```bash
+# 步骤3a：导出ONNX
+python pruning/export_onnx.py \
+  --model_path output/pruned_finetuned.ckpt \
+  --model_format pruned \
+  --output output/pruned.onnx
+
+# 步骤3b：构建TensorRT引擎（FP16精度）
+python pruning/build_trt_engine.py \
+  --onnx_path output/pruned.onnx \
+  --engine_path output/pruned_fp16.engine \
+  --precision fp16
+
+# 也支持FP32和INT8精度：
+python pruning/build_trt_engine.py \
+  --onnx_path output/pruned.onnx \
+  --engine_path output/pruned_int8.engine \
+  --precision int8
+```
+
+**ONNX导出细节：**
+- 使用静态输入形状 `(1, 1, 112, 112, 80)`，不设置动态轴，以获得TensorRT最佳优化效果
+- 权重内联存储在单个ONNX文件中（TensorRT要求）
+- 使用opset version 18
+
+**TensorRT构建细节：**
+- 支持FP32、FP16、INT8三种精度级别
+- INT8使用熵校准（`IInt8EntropyCalibrator2`），支持自定义校准数据
+- INT8模式下同时启用FP16回退（用于不支持INT8的层）
+- 4GB工作空间用于层优化策略搜索
+
+---
+
+### 性能基准测试
+
+```bash
+# PyTorch性能测试（原始 vs 剪枝）
+python pruning/benchmark.py \
+  --model_path best.ckpt --model_format state_dict \
+  --compare_path pruned.ckpt --compare_format pruned \
+  --num_runs 100 --amp
+
+# TensorRT性能测试
+python pruning/benchmark_trt.py \
+  --pytorch_model pruned.ckpt --model_format pruned \
+  --trt_engines pruned_fp32.engine pruned_fp16.engine pruned_int8.engine \
+  --trt_labels FP32 FP16 INT8 \
+  --num_runs 200
+```
+
+**单patch推理延迟对比（输入：112x112x80）：**
+
+| 配置 | 延迟 | 加速比 | 参数量 | 模型大小 |
+|------|------|--------|--------|----------|
+| 原始 PyTorch FP32 | 20.14ms | 1.00x | 5.75M | 22.0MB |
+| 原始 TRT FP32 | 14.54ms | 1.39x | 5.75M | 26.3MB |
+| 原始 TRT FP16 | 5.20ms | 3.87x | 5.75M | 13.5MB |
+| 原始 TRT INT8 | 3.39ms | 5.94x | 5.75M | 10.5MB |
+| 剪枝 PyTorch FP32 | 8.87ms | 2.27x | 1.44M | 5.6MB |
+| 剪枝 TRT FP32 | 4.49ms | 4.49x | 1.44M | 7.5MB |
+| **剪枝 TRT FP16** | **1.72ms** | **11.71x** | **1.44M** | **4.5MB** |
+| 剪枝 TRT INT8 | 1.72ms | 11.71x | 1.44M | 4.7MB |
+
+**最优配置：剪枝 + TRT FP16**。INT8在该模型规模下无额外加速收益，而FP16无需校准数据，部署更简单。
+
+---
+
+### 一键运行完整流程
+
+```bash
+MODEL_PATH=runs/wp5_baseline/best.ckpt \
+DATA_DIR=/path/to/data \
+PRUNING_RATIO=0.5 \
+FINETUNE_EPOCHS=50 \
+bash pruning/run_pruning_pipeline.sh
+```
+
+---
+
+## 最终结果总结
+
+| 指标 | 基线 | 优化后 | 变化 |
+|------|------|--------|------|
+| 单patch推理延迟 | 20.14ms | 1.72ms | **11.7x加速** |
+| 参数量 | 5.75M | 1.44M | **减少75%** |
+| 模型大小 | 22MB | 4.5MB (TRT FP16) | **减少80%** |
+| 平均Dice | 0.9038 | 0.9080 | **+0.0042（无损）** |
+
+**逐类Dice对比（174个测试样本）：**
+
+| 类别 | 基线 | 优化后 |
+|------|------|--------|
+| Class 0（背景） | 0.9919 | 0.9918 |
+| Class 1（铜柱） | 0.9409 | 0.9389 |
+| Class 2（焊料） | 0.9056 | 0.9062 |
+| Class 3（空洞） | 0.7995 | 0.8039 |
+| Class 4（铜垫） | 0.8818 | 0.8934 |
+| **平均Dice** | **0.9038** | **0.9069** |
+| **平均IoU** | **0.8516** | **0.8535** |
+
+---
+
+## 与IntelliScan流水线集成
+
+优化后的模型部署在 [IntelliScan](https://github.com/wangyisong-njust/intelliscan) 半导体检测流水线中。结合流水线级工程优化（去除中间文件I/O、GPU归一化、批量推理、跳过小crop的滑动窗口），端到端效果如下：
+
+| 指标 | 基线 | 优化后 | 变化 |
+|------|------|--------|------|
+| 分割阶段耗时 | 14.14s | 8.60s | **1.64x加速** |
+| 流水线总耗时 | 59.59s | 31.71s | **1.88x加速** |
+| 平均Dice | 0.9038 | 0.9069 | **+0.0031（无损）** |
+
+---
+
+## 生成的模型文件
+
+| 文件 | 说明 | 大小 |
+|------|------|------|
+| `segmentation_model_pruned.ckpt` | 剪枝+微调后的PyTorch模型 | 5.6MB |
+| `segmentation_pruned_fp16.engine` | TensorRT FP16推理引擎（生产部署用） | 4.5MB |
+
+## 依赖
+
+- Python >= 3.12
+- MONAI >= 1.5.1
+- nibabel >= 5.3.3
+- PyTorch（需CUDA支持）
+- ONNX、TensorRT、PyCUDA（用于优化流程）
