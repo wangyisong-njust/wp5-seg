@@ -465,13 +465,83 @@ bash pruning/run_pruning_pipeline.sh
 
 ## Integration with IntelliScan Pipeline
 
-The optimized model is deployed in the [IntelliScan](https://github.com/wangyisong-njust/intelliscan) semiconductor inspection pipeline. Combined with pipeline-level engineering optimizations (removing intermediate file I/O, GPU normalization, batch inference, skipping sliding window for small crops), the end-to-end results are:
+The optimized model is deployed in the [IntelliScan](https://github.com/wangyisong-njust/intelliscan) semiconductor inspection pipeline. Beyond model compression, we implemented **4 categories of pipeline-level engineering optimizations** to address the real bottleneck: file I/O accounted for 77% of processing time, while model inference was only 5%.
+
+### Bottleneck Analysis
+
+After integrating the TensorRT FP16 engine into the pipeline, the segmentation stage only improved from 14.14s to 13.42s — far below expectations. Per-bbox profiling revealed why:
+
+| Step | Time | Proportion |
+|------|------|-----------|
+| `nib.save()` x2 (write .nii.gz files) | 39.39ms | **77.1%** |
+| normalize (CPU numpy) | 8.27ms | 16.2% |
+| sliding_window_inference | 2.60ms | 5.1% |
+| Other (expand_bbox, to_tensor, argmax) | 0.84ms | 1.6% |
+| **Total per bbox** | **51.10ms** | **100%** |
+
+**Key finding:** The model inference was only 5% of per-bbox time. 77% was spent on gzip-compressing intermediate NIfTI files.
+
+### Optimization 1: Remove Intermediate File I/O (largest impact, 63.7%)
+
+**Problem:** Each bbox produced 2 `.nii.gz` files (crop + prediction), saved to disk, then read back by the metrology stage.
+
+**Solution:** Combine segmentation and metrology into a single phase (`--combined-seg-metrology`). Predictions are passed directly in memory to metrology computation, eliminating `nib.save()` + `nib.load()` entirely.
+
+Additionally, the YOLO detection stage was converted to in-memory mode (`--inmemory`): detection results are returned as Python dicts instead of writing thousands of text files to disk.
+
+**Effect:** Segmentation stage 14.14s → 10.60s (**saved 3.54s**)
+
+### Optimization 2: Skip sliding_window_inference for Small Crops
+
+**Problem:** Most bbox crops (~91x75x75) are smaller than the ROI size (112x112x80). MONAI's `sliding_window_inference` produces only a single window for these, but still incurs framework overhead (Gaussian weight computation, padding strategy, window management).
+
+**Solution:** For crops smaller than ROI size, directly pad to ROI size with **symmetric padding** (equal on both sides) and run a single forward pass, bypassing the sliding window framework. Crops larger than ROI still use sliding window.
+
+**Critical detail — symmetric padding:** The padding must be symmetric (equal on both sides) to match MONAI's internal padding strategy. Asymmetric padding (padding only one side) causes a 1.35% Dice drop:
+
+| Padding Method | Dice | vs Baseline |
+|---------------|------|-------------|
+| sliding_window (baseline) | 0.9069 | — |
+| Symmetric padding (correct) | 0.9069 | **0.0000** |
+| Asymmetric padding (incorrect) | 0.8945 | -0.0124 |
+
+### Optimization 3: GPU Normalization
+
+**Problem:** Per-crop ClipZScore normalization ran on CPU using numpy (`np.percentile` + `np.clip` + z-score), taking ~8ms/crop.
+
+**Solution:** Move normalization to GPU using `torch.quantile` + `torch.clamp`, keeping data on-device and eliminating CPU-GPU transfers.
+
+**Precision note:** `torch.quantile` and `np.percentile` have minor numerical differences, causing Dice to decrease from 0.9080 to 0.9069 (-0.0011), which is negligible.
+
+### Optimization 4: Batched Inference
+
+**Problem:** 95 bboxes processed one by one, each with independent CUDA kernel launch, memory allocation, etc.
+
+**Solution:** Pad multiple small crops to ROI size, stack them into a batch tensor, and run a single model forward pass. Default batch_size=8, reducing 95 individual inference calls to ~12 batched calls.
+
+### Per-Optimization Contribution Breakdown
+
+| Optimization | Time Saved | Contribution |
+|-------------|-----------|-------------|
+| Remove .nii.gz file I/O | 3.54s | **63.7%** |
+| GPU normalization | 0.58s | 10.4% |
+| Batched inference + TRT FP16 | 1.33s | 23.9% |
+| Skip sliding_window | 0.11s | 2.0% |
+| **Total** | **5.56s** | **100%** |
+
+### End-to-End Results
 
 | Metric | Baseline | Optimized | Change |
 |--------|----------|-----------|--------|
 | Segmentation stage | 14.14s | 8.60s | **1.64x faster** |
 | Full pipeline | 59.59s | 31.71s | **1.88x faster** |
 | Average Dice | 0.9038 | 0.9069 | **+0.0031 (lossless)** |
+
+### Two-Phase Optimization Summary
+
+1. **Model compression (Pruning + TensorRT)** achieved 11.7x single-inference speedup, but the actual pipeline speedup was limited because non-inference overhead (file I/O, framework overhead) dominated.
+2. **Pipeline engineering optimization** used profiling to locate the real bottleneck (77% on file I/O), then systematically removed intermediate file saves, moved preprocessing to GPU, and batched inference, achieving 1.65x pipeline-level speedup.
+3. The two phases are complementary: model compression reduced computation cost, while engineering optimization eliminated non-computation bottlenecks. Together they achieved 1.88x end-to-end speedup (59.59s → 31.71s) with no accuracy loss.
 
 ---
 

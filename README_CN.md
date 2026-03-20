@@ -486,13 +486,83 @@ bash pruning/run_pruning_pipeline.sh
 
 ## 与IntelliScan流水线集成
 
-优化后的模型部署在 [IntelliScan](https://github.com/wangyisong-njust/intelliscan) 半导体检测流水线中。结合流水线级工程优化（去除中间文件I/O、GPU归一化、批量推理、跳过小crop的滑动窗口），端到端效果如下：
+优化后的模型部署在 [IntelliScan](https://github.com/wangyisong-njust/intelliscan) 半导体检测流水线中。除了模型压缩之外，我们还实施了 **4大类Pipeline级工程优化**，以解决真正的瓶颈：文件I/O占处理时间的77%，而模型推理仅占5%。
+
+### 瓶颈分析
+
+将TRT FP16引擎集成到pipeline后，分割阶段仅从14.14s降到13.42s，加速效果远低于预期。逐步骤profiling揭示了原因：
+
+| 步骤 | 耗时 | 占比 |
+|------|------|------|
+| `nib.save()` x2（保存.nii.gz文件） | 39.39ms | **77.1%** |
+| normalize（CPU numpy） | 8.27ms | 16.2% |
+| sliding_window_inference | 2.60ms | 5.1% |
+| 其他（expand_bbox, to_tensor, argmax） | 0.84ms | 1.6% |
+| **每个bbox合计** | **51.10ms** | **100%** |
+
+**关键发现：** 模型推理仅占每个bbox处理时间的5%，77%的时间花在gzip压缩写中间NIfTI文件上。
+
+### 优化1：去除中间文件I/O（最大贡献，63.7%）
+
+**问题：** 每个bbox保存2个`.nii.gz`文件（crop + prediction），写入磁盘后，metrology阶段再从磁盘读回。
+
+**方案：** 将分割和计量合并为单个阶段（`--combined-seg-metrology`），预测结果直接在内存中传递给metrology计算，完全消除 `nib.save()` + `nib.load()`。
+
+此外，YOLO检测阶段也改为内存模式（`--inmemory`）：检测结果以Python字典形式返回，而非写入成千上万个文本文件到磁盘。
+
+**效果：** 分割阶段 14.14s → 10.60s（**节省3.54s**）
+
+### 优化2：跳过小crop的sliding_window_inference
+
+**问题：** Pipeline中大多数bbox crop尺寸（约91x75x75）小于ROI尺寸（112x112x80）。MONAI的 `sliding_window_inference` 对这些crop只会产生单个窗口，但框架开销（高斯权重计算、padding策略、窗口管理）仍然存在。
+
+**方案：** 对小于ROI尺寸的crop，直接使用**对称padding**（两侧均匀填充）到ROI尺寸后做单次forward，绕过sliding window框架。大于ROI的crop仍走sliding window。
+
+**关键细节——对称padding：** padding必须是对称的（两侧等量填充），以匹配MONAI内部的padding策略。非对称padding（仅填充一侧）会导致Dice下降1.35%：
+
+| Padding方式 | Dice | vs 基线 |
+|------------|------|---------|
+| sliding_window（基线） | 0.9069 | — |
+| 对称padding（正确） | 0.9069 | **0.0000** |
+| 非对称padding（错误） | 0.8945 | -0.0124 |
+
+### 优化3：GPU归一化
+
+**问题：** 每个crop的ClipZScore归一化在CPU上用numpy执行（`np.percentile` + `np.clip` + z-score），约8ms/crop。
+
+**方案：** 将归一化搬到GPU，使用 `torch.quantile` + `torch.clamp` 替代numpy操作，数据全程不离开GPU，消除CPU-GPU传输开销。
+
+**精度说明：** `torch.quantile` 与 `np.percentile` 存在微小数值差异，导致Dice从0.9080降至0.9069（-0.0011），可忽略不计。
+
+### 优化4：批量推理
+
+**问题：** 95个bbox逐个推理，每次都有独立的CUDA kernel launch、内存分配等开销。
+
+**方案：** 将多个小crop对称padding到ROI尺寸后stack成batch，一次model forward处理多个crop。默认batch_size=8，将95次独立推理调用减少为约12次batch调用。
+
+### 各优化贡献分解
+
+| 优化 | 节省时间 | 贡献占比 |
+|------|---------|---------|
+| 去除.nii.gz文件I/O | 3.54s | **63.7%** |
+| GPU归一化 | 0.58s | 10.4% |
+| 批量推理 + TRT FP16 | 1.33s | 23.9% |
+| 跳过sliding_window | 0.11s | 2.0% |
+| **合计** | **5.56s** | **100%** |
+
+### 端到端效果
 
 | 指标 | 基线 | 优化后 | 变化 |
 |------|------|--------|------|
 | 分割阶段耗时 | 14.14s | 8.60s | **1.64x加速** |
 | 流水线总耗时 | 59.59s | 31.71s | **1.88x加速** |
 | 平均Dice | 0.9038 | 0.9069 | **+0.0031（无损）** |
+
+### 两阶段优化总结
+
+1. **模型压缩（剪枝 + TensorRT）** 将单次推理加速11.7倍，但受限于pipeline中非推理开销（文件I/O、框架开销等），实际pipeline加速有限。
+2. **Pipeline工程优化** 通过profiling定位真正瓶颈（77%时间在文件I/O），针对性地去除中间文件保存、GPU化预处理、批量推理，实现1.65倍pipeline级加速。
+3. 两阶段优化互补：模型压缩降低了推理计算量，工程优化消除了非计算瓶颈，最终在精度无损的前提下实现整体pipeline **1.88倍加速**（59.59s → 31.71s）。
 
 ---
 
