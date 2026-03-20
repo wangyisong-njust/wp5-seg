@@ -43,6 +43,44 @@ wp5-seg/
 - Class 3: Void (defect)
 - Class 4: Copper Pad
 
+### MONAI BasicUNet vs Original UNet
+
+The original UNet (2015) is a 2D architecture for medical image segmentation with the classic encoder-decoder + skip connection design. MONAI BasicUNet is a modernized 3D extension with several key differences:
+
+| Feature | Original UNet | MONAI BasicUNet |
+|---------|--------------|-----------------|
+| **Dimension** | 2D (Conv2d) | **3D** (Conv3d) — processes volumetric data |
+| **Conv block** | 2x 3x3 Conv + BN + ReLU | TwoConv: 2x 3x3x3 Conv + **InstanceNorm3d** + Dropout + **LeakyReLU** |
+| **Channel config** | Fixed (64, 128, 256, 512, 1024) | **Configurable** via `features=(f0, f1, f2, f3, f4, f5)` |
+| **Upsampling** | Transposed conv or bilinear | **ConvTranspose3d** (learnable) |
+| **Normalization** | BatchNorm | **InstanceNorm3d** (suited for small batches) |
+| **Activation** | ReLU | **LeakyReLU** (avoids dead neurons) |
+| **Skip connections** | Concatenation | Concatenation (same) |
+
+In short: BasicUNet = **3D UNet + InstanceNorm + LeakyReLU + configurable channels** — a modern adaptation of UNet for 3D medical imaging.
+
+### Why InstanceNorm3d instead of BatchNorm?
+
+Normalization layers stabilize training by normalizing intermediate activations. The key difference between normalization methods is **which dimensions** the mean and variance are computed over:
+
+Given an input tensor of shape `[B, C, D, H, W]` (batch, channels, depth, height, width):
+
+| Normalization | Computation Scope | Best For |
+|--------------|-------------------|----------|
+| **BatchNorm** | All voxels of the **same channel across the entire batch** | Large batch sizes (e.g., classification) |
+| **InstanceNorm** | All voxels of **one channel in one sample** only | Small batch sizes (e.g., segmentation, style transfer) |
+| LayerNorm | All channels and voxels of one sample | NLP, Transformers |
+| GroupNorm | Grouped channels of one sample | Between BN and IN |
+
+```
+Input: [B=4, C=32, D, H, W]
+
+BatchNorm:    computes mean/var across all 4 samples for the same channel
+InstanceNorm: computes mean/var for 1 sample, 1 channel independently
+```
+
+**Why does this matter here?** 3D medical image segmentation typically uses very small batch sizes (1-4) because 3D volumes consume significant GPU memory. BatchNorm produces noisy statistics with small batches (unstable variance estimates), while InstanceNorm computes statistics per-sample independently, so it remains stable regardless of batch size.
+
 ## Setup
 
 ```bash
@@ -92,7 +130,63 @@ python train.py \
 | Inference | Sliding window (overlap=0.5, Gaussian weighting) |
 
 **Data preprocessing — ClipZScoreNormalize:**
-Robust normalization that clips intensities to the [1st, 99th] percentile range, then applies z-score standardization. This handles outliers and extreme intensity ranges common in semiconductor CT data.
+
+The name breaks down into three operations: **Clip** + **Z-Score** + **Normalize**.
+
+**What is Z-Score?** Z-Score (standard score) is a fundamental statistical standardization method:
+
+```
+z = (x - mean) / std
+```
+
+It transforms data to have mean=0 and standard deviation=1. The resulting value represents "how many standard deviations away from the mean."
+
+**What is Clip?** Clip means **clamping** — forcing values outside a range to the range boundaries:
+
+```
+original data = [0.1, 0.5, 0.8, 1.2, 100.0, -50.0]
+                                       ↑        ↑ outliers
+
+after clip to [0, 2] = [0.1, 0.5, 0.8, 1.2, 2.0, 0.0]
+                                              ↑     ↑ clamped
+```
+
+**The complete ClipZScoreNormalize pipeline:**
+
+```python
+# Example: a 3D volume with voxel intensity values
+data = [0, 1, 2, 3, 5, 8, 10, 12, 15, 500]
+#                                       ↑ outlier (e.g., metal artifact)
+
+# Step 1: Compute percentiles
+p1  = 1st percentile  ≈ 0.09    # boundary of the lowest 1%
+p99 = 99th percentile ≈ 66.5    # boundary of the highest 1%
+
+# Step 2: Clip — clamp to [p1, p99] range
+clipped = [0.09, 1, 2, 3, 5, 8, 10, 12, 15, 66.5]
+#          ↑ pulled to p1                     ↑ 500 clamped to 66.5
+
+# Step 3: Z-Score standardization
+mean = mean(clipped) ≈ 12.26
+std  = std(clipped)  ≈ 19.5
+result = (clipped - mean) / std
+# Final values roughly in [-2, +3], mean=0, std=1
+```
+
+**Why not just use min-max normalization?**
+
+```
+# min-max normalization:
+normalized = (x - min) / (max - min)
+
+# If data = [0, 1, 2, 3, ..., 15, 500]
+# min=0, max=500
+# Then 15 / (500-0) = 0.03
+# All normal data gets squeezed into [0, 0.03] — a tiny range
+# 99% of the dynamic range is wasted by a single outlier
+```
+
+ClipZScore first removes outliers via percentile clipping, then standardizes. This preserves the full dynamic range for normal data. This is critical for semiconductor CT data, where metallic materials (copper, solder) can produce extreme intensity values.
 
 ### Evaluation
 
